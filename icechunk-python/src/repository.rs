@@ -2125,6 +2125,57 @@ impl PyRepository {
         })
     }
 
+    pub(crate) fn merge_branches(
+        &self,
+        py: Python<'_>,
+        source: &str,
+        target: &str,
+        message: &str,
+    ) -> PyResult<String> {
+        // This function calls block_on, so we need to allow other thread python to make progress
+        py.detach(move || {
+            pyo3_async_runtimes::tokio::get_runtime().block_on(
+                async move {
+                    let repo = self.0.read().await;
+                    let snap_id = repo
+                        .merge_branches(source, target, message)
+                        .await
+                        .map_err(
+                            PyIcechunkStoreError::RepositoryError,
+                        )?;
+                    Ok(snap_id.to_string())
+                },
+            )
+        })
+    }
+
+    fn merge_branches_async<'py>(
+        &'py self,
+        py: Python<'py>,
+        source: &str,
+        target: &str,
+        message: &str,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let repository = Arc::clone(&self.0);
+        let source = source.to_owned();
+        let target = target.to_owned();
+        let message = message.to_owned();
+
+        pyo3_async_runtimes::tokio::future_into_py(
+            py,
+            async move {
+                let repo = repository.read().await;
+                let snap_id = repo
+                    .merge_branches(&source, &target, &message)
+                    .await
+                    .map_err(
+                        PyIcechunkStoreError::RepositoryError,
+                    )?;
+                Ok(snap_id.to_string())
+            },
+        )
+    }
+
     pub(crate) fn delete_tag(&self, py: Python<'_>, tag: &str) -> PyResult<()> {
         // This function calls block_on, so we need to allow other thread python to make progress
         py.detach(move || {

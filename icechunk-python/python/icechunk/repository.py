@@ -1160,6 +1160,60 @@ class Repository:
         """
         await self._repository.delete_branch_async(branch)
 
+    def merge_branches(
+        self, source: str, target: str, message: str
+    ) -> str:
+        """Merge source branch into target branch.
+
+        Only succeeds when both branches have exclusively chunk
+        modifications since their common ancestor, and those
+        modifications are to completely disjoint sets of chunks.
+
+        Parameters
+        ----------
+        source : str
+            The source branch to merge from.
+        target : str
+            The target branch to merge into.
+        message : str
+            The merge commit message.
+
+        Returns
+        -------
+        str
+            The snapshot ID of the merge commit.
+        """
+        return self._repository.merge_branches(
+            source, target, message
+        )
+
+    async def merge_branches_async(
+        self, source: str, target: str, message: str
+    ) -> str:
+        """Merge source branch into target branch (async version).
+
+        Only succeeds when both branches have exclusively chunk
+        modifications since their common ancestor, and those
+        modifications are to completely disjoint sets of chunks.
+
+        Parameters
+        ----------
+        source : str
+            The source branch to merge from.
+        target : str
+            The target branch to merge into.
+        message : str
+            The merge commit message.
+
+        Returns
+        -------
+        str
+            The snapshot ID of the merge commit.
+        """
+        return await self._repository.merge_branches_async(
+            source, target, message
+        )
+
     def delete_tag(self, tag: str) -> None:
         """
         Delete a tag.

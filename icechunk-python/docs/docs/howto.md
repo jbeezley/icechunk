@@ -230,6 +230,16 @@ session = repo.writable_session("dev")
 repo.reset_branch("dev", snapshot_id=snapshot_id)
 ```
 
+### Merge Branches
+
+Merge a source branch into a target branch. Both branches must have only chunk-level modifications to disjoint chunks since their common ancestor.
+
+```python
+repo.merge_branches("feature", "main", "merge feature into main")
+```
+
+For more details, see [Branch Merging](./version-control.md#branch-merging).
+
 ### Create a Tag
 
 ```python

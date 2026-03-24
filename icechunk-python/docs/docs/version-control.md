@@ -243,6 +243,73 @@ And then finally delete a tag with [`delete_tag`](./reference.md#icechunk.Reposi
 repo.delete_tag("v1.0.0")
 ```
 
+## Branch Merging
+
+When two branches have diverged, you can merge one into the other using [`repo.merge_branches()`](./reference.md#icechunk.Repository.merge_branches). This creates a new merge snapshot on the target branch that combines the chunk modifications from both branches.
+
+```python exec="on" session="version" source="material-block" result="code"
+import icechunk
+import numpy as np
+import zarr
+
+repo = icechunk.Repository.create(icechunk.in_memory_storage())
+
+# Create an initial commit with a chunked array
+session = repo.writable_session("main")
+root = zarr.create_group(session.store)
+root.create_array("data", shape=(6,), chunks=(3,), dtype="f8")
+snap0 = session.commit("create empty dataset")
+
+# Create a branch for each file to ingest in parallel
+repo.create_branch("ingest-file-1", snap0)
+repo.create_branch("ingest-file-2", snap0)
+
+# Ingest file 1: write the first chunk (indices 0-2)
+session = repo.writable_session("ingest-file-1")
+store = session.store
+arr = zarr.open_array(store=store, path="data", mode="r+")
+arr[0:3] = [1.0, 2.0, 3.0]
+session.commit("ingest file 1")
+
+# Ingest file 2: write the second chunk (indices 3-5)
+session = repo.writable_session("ingest-file-2")
+store = session.store
+arr = zarr.open_array(store=store, path="data", mode="r+")
+arr[3:6] = [4.0, 5.0, 6.0]
+session.commit("ingest file 2")
+
+# Merge both branches back into main
+repo.merge_branches("ingest-file-1", "main", "merge file 1")
+merge_snap = repo.merge_branches(
+    "ingest-file-2", "main", "merge file 2"
+)
+print(f"Merge snapshot: {merge_snap}")
+```
+
+After merging, the complete dataset is visible on `main`:
+
+```python exec="on" session="version" source="material-block" result="code"
+session = repo.readonly_session(snapshot_id=merge_snap)
+store = session.store
+arr = zarr.open_array(store=store, path="data", mode="r")
+print(f"data = {arr[:]}")
+```
+
+The source branches are preserved after the merge — only the target branch is updated.
+
+### Merge Restrictions
+
+Branch merging currently requires that **both** branches have only chunk-level modifications since their common ancestor. A merge will be rejected if:
+
+- **Structural changes**: Either branch has created, deleted, or updated arrays or groups, or moved nodes.
+- **Overlapping chunks**: Both branches modified the same chunk coordinates in the same array.
+
+If a merge is rejected due to overlapping chunks, you will receive a `MergeConflict` error identifying the specific `(array, chunk)` pairs in conflict.
+
+!!! note
+
+    For same-branch conflicts (two sessions writing to the same branch), use [session rebasing](#conflict-resolution) instead.
+
 ## Conflict Resolution
 
 Icechunk is a serverless distributed system, and as such, it is possible to have multiple users or processes modifying the same data at the same time. Icechunk relies on the consistency guarantees of the underlying storage backends to ensure that the data is always consistent. In situations where two users or processes attempt to modify the same data at the same time, Icechunk will detect the conflict and raise an exception at commit time. This can be illustrated with the following example.

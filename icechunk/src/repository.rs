@@ -43,14 +43,15 @@ use crate::{
         find_feature_flag_id, raise_if_feature_flag_disabled,
     },
     format::{
-        IcechunkFormatError, IcechunkFormatErrorKind, ManifestId, NodeId, Path,
-        SnapshotId,
+        ChunkIndices, IcechunkFormatError, IcechunkFormatErrorKind, ManifestId, NodeId,
+        Path, SnapshotId,
         format_constants::SpecVersionBin,
         repo_info::{RepoAvailability, RepoInfo, RepoStatus, UpdateType},
         snapshot::{
-            ManifestFileInfo, NodeData, NodeType, Snapshot, SnapshotInfo,
+            ManifestFileInfo, NodeData, NodeSnapshot, NodeType, Snapshot, SnapshotInfo,
             SnapshotProperties,
         },
+        transaction_log::TransactionLog,
     },
     refs::{self, Ref, RefError, RefErrorKind},
     session::{Session, SessionError, SessionErrorKind, SessionResult},
@@ -153,6 +154,16 @@ pub enum RepositoryErrorKind {
     BadRepoVersion { minimum_spec_version: SpecVersionBin },
     #[error("concurrency error, lock could not be acquired")]
     PoisonLock,
+    #[error("cannot merge branch into itself")]
+    CannotMergeBranchIntoItself,
+    #[error(
+        "no common ancestor found between branches `{source_branch}` and `{target_branch}`"
+    )]
+    NoCommonAncestor { source_branch: String, target_branch: String },
+    #[error("merge not supported: {reason}")]
+    MergeNotSupported { reason: String },
+    #[error("merge conflict: overlapping chunk modifications")]
+    MergeConflict { conflicts: Vec<(NodeId, Vec<ChunkIndices>)> },
     #[error("unexpected error: {0}")]
     Other(String),
 }
@@ -1944,6 +1955,437 @@ impl Repository {
 
     async fn raise_if_cant_write(&self, msg: impl Into<String>) -> RepositoryResult<()> {
         raise_if_cant_write(self.storage().as_ref(), msg).await
+    }
+
+    /// Find the most recent common ancestor of two branches.
+    ///
+    /// Walks ancestry from both branch tips, collecting snapshot IDs
+    /// from the target into a set, then streaming through the source
+    /// ancestors until one is found in that set.
+    async fn find_common_ancestor(
+        &self,
+        source: &str,
+        target: &str,
+    ) -> RepositoryResult<SnapshotId> {
+        let source_tip = self.lookup_branch(source).await?;
+        let target_tip = self.lookup_branch(target).await?;
+
+        // Fast path: same tip
+        if source_tip == target_tip {
+            return Ok(source_tip);
+        }
+
+        // Collect target ancestry into a set
+        let target_ids: HashSet<SnapshotId> = self
+            .ancestry(&VersionInfo::SnapshotId(target_tip))
+            .await
+            .inject()?
+            .map_ok(|info| info.id)
+            .try_collect()
+            .await
+            .inject()?;
+
+        // Walk source ancestry, find first match
+        let source_ancestry =
+            self.ancestry(&VersionInfo::SnapshotId(source_tip)).await.inject()?;
+        tokio::pin!(source_ancestry);
+
+        while let Some(info) = source_ancestry.try_next().await.inject()? {
+            if target_ids.contains(&info.id) {
+                return Ok(info.id);
+            }
+        }
+
+        Err(RepositoryError::capture(RepositoryErrorKind::NoCommonAncestor {
+            source_branch: source.to_string(),
+            target_branch: target.to_string(),
+        }))
+    }
+
+    /// Collect all changes on a branch since `ancestor_id` into a
+    /// `DiffBuilder`.
+    ///
+    /// Walks from the branch tip back to (but not including)
+    /// `ancestor_id`, fetching each snapshot's `TransactionLog`
+    /// and aggregating changes.
+    async fn collect_branch_changes(
+        &self,
+        branch: &str,
+        ancestor_id: &SnapshotId,
+    ) -> RepositoryResult<DiffBuilder> {
+        let branch_tip = self.lookup_branch(branch).await?;
+        let ancestor_id = ancestor_id.clone();
+
+        let all_snaps: Vec<SnapshotInfo> = self
+            .ancestry(&VersionInfo::SnapshotId(branch_tip))
+            .await
+            .inject()?
+            .try_take_while(|snap_info| ready(Ok(snap_info.id != ancestor_id)))
+            .try_collect()
+            .await
+            .inject()?;
+
+        let fut: FuturesOrdered<_> = all_snaps
+            .iter()
+            .filter_map(|snap_info| {
+                if self.spec_version == SpecVersionBin::V1 && snap_info.is_initial() {
+                    None
+                } else {
+                    Some(
+                        self.asset_manager
+                            .fetch_transaction_log(&snap_info.id)
+                            .in_current_span(),
+                    )
+                }
+            })
+            .collect();
+
+        let builder = fut
+            .try_fold(DiffBuilder::default(), |mut res, log| {
+                res.add_changes(log.as_ref());
+                ready(Ok(res))
+            })
+            .await
+            .inject()?;
+
+        Ok(builder)
+    }
+
+    /// Merge source branch into target branch.
+    ///
+    /// Only succeeds when both branches have exclusively chunk
+    /// modifications since their common ancestor, and those
+    /// modifications are to completely disjoint sets of
+    /// (array, chunk coordinate) pairs.
+    ///
+    /// This is a fast index update — no chunk data is read or
+    /// rewritten. The source branch is preserved after the merge.
+    #[instrument(skip(self))]
+    pub async fn merge_branches(
+        &self,
+        source: &str,
+        target: &str,
+        message: &str,
+    ) -> RepositoryResult<SnapshotId> {
+        self.raise_if_cant_write("Cannot merge branches").await?;
+
+        if source == target {
+            return Err(RepositoryError::capture(
+                RepositoryErrorKind::CannotMergeBranchIntoItself,
+            ));
+        }
+
+        // Step 1: Find common ancestor
+        let ancestor_id = self.find_common_ancestor(source, target).await?;
+
+        let target_tip = self.lookup_branch(target).await?;
+
+        // Fast-forward for V1 only: if target tip == ancestor,
+        // just advance the target pointer to source tip
+        if self.spec_version == SpecVersionBin::V1 && target_tip == ancestor_id {
+            let source_tip = self.lookup_branch(source).await?;
+            refs::update_branch(
+                self.storage.as_ref(),
+                &self.storage_settings,
+                target,
+                source_tip.clone(),
+                Some(&target_tip),
+            )
+            .await
+            .inject()?;
+            return Ok(source_tip);
+        }
+
+        // Reverse fast-forward: source tip == ancestor
+        let source_tip = self.lookup_branch(source).await?;
+        if source_tip == ancestor_id {
+            // Nothing to merge — target already contains source
+            return Ok(target_tip);
+        }
+
+        // Step 2: Collect changes on each branch
+        let (source_changes, target_changes) = try_join!(
+            self.collect_branch_changes(source, &ancestor_id),
+            self.collect_branch_changes(target, &ancestor_id),
+        )?;
+
+        // Step 3: Validate — chunks only
+        if source_changes.has_structural_changes() {
+            return Err(RepositoryError::capture(
+                RepositoryErrorKind::MergeNotSupported {
+                    reason: format!(
+                        "source branch '{source}' has structural \
+                         changes (new/deleted/updated arrays or \
+                         groups)"
+                    ),
+                },
+            ));
+        }
+        if target_changes.has_structural_changes() {
+            return Err(RepositoryError::capture(
+                RepositoryErrorKind::MergeNotSupported {
+                    reason: format!(
+                        "target branch '{target}' has structural \
+                         changes (new/deleted/updated arrays or \
+                         groups)"
+                    ),
+                },
+            ));
+        }
+
+        // Step 4: Validate disjointness
+        let overlaps = source_changes.overlapping_chunks(&target_changes);
+        if !overlaps.is_empty() {
+            return Err(RepositoryError::capture(RepositoryErrorKind::MergeConflict {
+                conflicts: overlaps,
+            }));
+        }
+
+        // Step 5: Build merged snapshot
+        let (new_snapshot, merged_tx_log) = self
+            .build_merge_snapshot(
+                &ancestor_id,
+                source,
+                target,
+                &source_changes,
+                &target_changes,
+                message,
+            )
+            .await?;
+
+        let new_snapshot_id = new_snapshot.id();
+
+        // Step 6: Write snapshot and transaction log
+        self.asset_manager.write_snapshot(Arc::clone(&new_snapshot)).await?;
+        self.asset_manager
+            .write_transaction_log(new_snapshot_id.clone(), Arc::new(merged_tx_log))
+            .await?;
+
+        // Step 7: Update target branch ref
+        match self.spec_version {
+            SpecVersionBin::V1 => {
+                refs::update_branch(
+                    self.storage.as_ref(),
+                    &self.storage_settings,
+                    target,
+                    new_snapshot_id.clone(),
+                    Some(&target_tip),
+                )
+                .await
+                .inject()?;
+            }
+            SpecVersionBin::V2 => {
+                let target = target.to_string();
+                let new_snapshot_id_c = new_snapshot_id.clone();
+                let num_updates = self.config.num_updates_per_repo_info_file();
+                let spec_version = self.spec_version;
+
+                let snap_info = SnapshotInfo {
+                    parent_id: Some(target_tip.clone()),
+                    ..new_snapshot.as_ref().try_into().inject()?
+                };
+
+                let do_update = move |repo_info: Arc<RepoInfo>, backup_path: &str, _| {
+                    let update_type = UpdateType::NewCommitUpdate {
+                        branch: target.clone(),
+                        new_snap_id: new_snapshot_id_c.clone(),
+                    };
+                    Ok(Arc::new(
+                        repo_info
+                            .add_snapshot(
+                                spec_version,
+                                snap_info.clone(),
+                                Some(&target),
+                                update_type,
+                                None,
+                                backup_path,
+                                num_updates,
+                            )
+                            .inject()?,
+                    ))
+                };
+                self.asset_manager
+                    .update_repo_info(
+                        self.config.repo_update_retries().retries(),
+                        do_update,
+                    )
+                    .await?;
+            }
+        }
+
+        Ok(new_snapshot_id)
+    }
+
+    /// Build a merged snapshot combining changes from source and
+    /// target branches since their common ancestor.
+    ///
+    /// Iterates over the ancestor snapshot's nodes. For each array
+    /// node, if it was modified by one or both branches, takes the
+    /// updated version from the appropriate branch tip snapshot.
+    async fn build_merge_snapshot(
+        &self,
+        ancestor_id: &SnapshotId,
+        source_branch: &str,
+        target_branch: &str,
+        source_changes: &DiffBuilder,
+        target_changes: &DiffBuilder,
+        message: &str,
+    ) -> RepositoryResult<(Arc<Snapshot>, TransactionLog)> {
+        let source_tip_id = self.lookup_branch(source_branch).await?;
+        let target_tip_id = self.lookup_branch(target_branch).await?;
+
+        let (ancestor_snap, source_snap, target_snap) = try_join!(
+            self.asset_manager.fetch_snapshot(ancestor_id),
+            self.asset_manager.fetch_snapshot(&source_tip_id),
+            self.asset_manager.fetch_snapshot(&target_tip_id),
+        )?;
+
+        // Identify which arrays were modified on each branch
+        let source_arrays: HashSet<&NodeId> =
+            source_changes.updated_chunk_node_ids().collect();
+        let target_arrays: HashSet<&NodeId> =
+            target_changes.updated_chunk_node_ids().collect();
+
+        // Collect manifest files from both branch tips
+        let mut manifest_files: HashSet<ManifestFileInfo> = HashSet::new();
+        for mf in source_snap.manifest_files() {
+            manifest_files.insert(mf);
+        }
+        for mf in target_snap.manifest_files() {
+            manifest_files.insert(mf);
+        }
+        for mf in ancestor_snap.manifest_files() {
+            manifest_files.insert(mf);
+        }
+
+        // Build merged node list from ancestor
+        let mut all_nodes: Vec<NodeSnapshot> = Vec::new();
+
+        for node_result in ancestor_snap.iter() {
+            let node = node_result.inject()?;
+
+            let node_id = &node.id;
+            let in_source = source_arrays.contains(node_id);
+            let in_target = target_arrays.contains(node_id);
+
+            if in_source && in_target {
+                // Both branches modified this array (different
+                // chunks). Combine ManifestRefs from both tips.
+                let sn = source_snap.get_node(&node.path).inject()?;
+                let tn = target_snap.get_node(&node.path).inject()?;
+                if let (
+                    NodeData::Array { manifests: s_manifests, .. },
+                    NodeData::Array { manifests: t_manifests, .. },
+                ) = (&sn.node_data, &tn.node_data)
+                {
+                    let mut merged_manifests = Vec::new();
+                    merged_manifests.extend(s_manifests.iter().cloned());
+                    merged_manifests.extend(t_manifests.iter().cloned());
+
+                    all_nodes.push(NodeSnapshot {
+                        id: node.id.clone(),
+                        path: node.path.clone(),
+                        user_data: node.user_data.clone(),
+                        node_data: NodeData::Array {
+                            manifests: merged_manifests,
+                            shape: match &node.node_data {
+                                NodeData::Array { shape, .. } => shape.clone(),
+                                _ => unreachable!(),
+                            },
+                            dimension_names: match &node.node_data {
+                                NodeData::Array { dimension_names, .. } => {
+                                    dimension_names.clone()
+                                }
+                                _ => unreachable!(),
+                            },
+                        },
+                    });
+                } else {
+                    all_nodes.push(node);
+                }
+            } else if in_source {
+                // Only source modified — take source's node
+                let source_node = source_snap.get_node(&node.path).inject()?;
+                all_nodes.push(source_node.as_ref().clone());
+            } else if in_target {
+                // Only target modified — take target's node
+                let target_node = target_snap.get_node(&node.path).inject()?;
+                all_nodes.push(target_node.as_ref().clone());
+            } else {
+                // Unmodified — keep ancestor's version
+                all_nodes.push(node);
+            }
+        }
+
+        // Sort by path for from_iter
+        all_nodes.sort_by(|a, b| a.path.cmp(&b.path));
+
+        let parent_id = if self.spec_version == SpecVersionBin::V1 {
+            Some(target_tip_id.clone())
+        } else {
+            None
+        };
+
+        let new_snapshot = Snapshot::from_iter(
+            None,
+            parent_id,
+            self.spec_version,
+            message,
+            None,
+            manifest_files.into_iter().collect(),
+            None,
+            all_nodes.into_iter().map(Ok::<_, IcechunkFormatError>),
+        )
+        .inject()?;
+
+        // Build merged transaction log
+        let new_snapshot_id = new_snapshot.id();
+        let source_logs =
+            self.collect_transaction_logs(source_branch, ancestor_id).await?;
+        let target_logs =
+            self.collect_transaction_logs(target_branch, ancestor_id).await?;
+        let all_logs: Vec<&TransactionLog> =
+            source_logs.iter().chain(target_logs.iter()).map(|l| l.as_ref()).collect();
+        let merged_tx_log = TransactionLog::merge(&new_snapshot_id, all_logs);
+
+        Ok((Arc::new(new_snapshot), merged_tx_log))
+    }
+
+    /// Collect raw `TransactionLog` objects for a branch since
+    /// ancestor.
+    async fn collect_transaction_logs(
+        &self,
+        branch: &str,
+        ancestor_id: &SnapshotId,
+    ) -> RepositoryResult<Vec<Arc<TransactionLog>>> {
+        let branch_tip = self.lookup_branch(branch).await?;
+        let ancestor_id = ancestor_id.clone();
+
+        let all_snaps: Vec<SnapshotInfo> = self
+            .ancestry(&VersionInfo::SnapshotId(branch_tip))
+            .await
+            .inject()?
+            .try_take_while(|snap_info| ready(Ok(snap_info.id != ancestor_id)))
+            .try_collect()
+            .await
+            .inject()?;
+
+        let fut: FuturesOrdered<_> = all_snaps
+            .iter()
+            .filter_map(|snap_info| {
+                if self.spec_version == SpecVersionBin::V1 && snap_info.is_initial() {
+                    None
+                } else {
+                    Some(
+                        self.asset_manager
+                            .fetch_transaction_log(&snap_info.id)
+                            .in_current_span(),
+                    )
+                }
+            })
+            .collect();
+
+        fut.try_collect().await.inject()
     }
 }
 
@@ -4224,6 +4666,493 @@ mod tests {
         }
         do_distributed_writes(&mut session, &array_path).await?;
 
+        Ok(())
+    }
+
+    #[tokio_test]
+    #[apply(spec_version_cases)]
+    async fn test_find_common_ancestor(
+        spec_version: SpecVersionBin,
+    ) -> Result<(), Box<dyn Error>> {
+        let storage: Arc<dyn Storage + Send + Sync> = new_in_memory_storage().await?;
+        let repo = Repository::create(
+            None,
+            Arc::clone(&storage),
+            HashMap::new(),
+            Some(spec_version),
+            true,
+        )
+        .await?;
+
+        // Commit to main
+        let mut session = repo.writable_session("main").await?;
+        session.add_group(Path::root(), Bytes::copy_from_slice(b"")).await?;
+        let snap0 = session.commit("initial").execute().await?;
+
+        // Create branch "feature" at snap0
+        repo.create_branch("feature", &snap0).await?;
+
+        // Commit to main
+        let mut session = repo.writable_session("main").await?;
+        session.add_group("/group_main".try_into()?, Bytes::copy_from_slice(b"")).await?;
+        let _snap_main = session.commit("main commit").execute().await?;
+
+        // Commit to feature
+        let mut session = repo.writable_session("feature").await?;
+        session
+            .add_group("/group_feature".try_into()?, Bytes::copy_from_slice(b""))
+            .await?;
+        let _snap_feature = session.commit("feature commit").execute().await?;
+
+        // Common ancestor should be snap0
+        let ancestor = repo.find_common_ancestor("main", "feature").await?;
+        assert_eq!(ancestor, snap0);
+
+        Ok(())
+    }
+
+    #[tokio_test]
+    #[apply(spec_version_cases)]
+    async fn test_collect_branch_changes(
+        spec_version: SpecVersionBin,
+    ) -> Result<(), Box<dyn Error>> {
+        let storage: Arc<dyn Storage + Send + Sync> = new_in_memory_storage().await?;
+        let repo = Repository::create(
+            None,
+            Arc::clone(&storage),
+            HashMap::new(),
+            Some(spec_version),
+            true,
+        )
+        .await?;
+
+        // Create initial array
+        let mut session = repo.writable_session("main").await?;
+        session.add_group(Path::root(), Bytes::copy_from_slice(b"")).await?;
+        session
+            .add_array(
+                "/array".try_into()?,
+                ArrayShape::new(vec![(10, 1)]).unwrap(),
+                None,
+                Bytes::new(),
+            )
+            .await?;
+        let snap0 = session.commit("initial").execute().await?;
+
+        // Write a chunk on main
+        let mut session = repo.writable_session("main").await?;
+        session
+            .set_chunk_ref(
+                "/array".try_into()?,
+                ChunkIndices(vec![0]),
+                Some(ChunkPayload::Inline(Bytes::from_static(b"hello"))),
+            )
+            .await?;
+        let _snap1 = session.commit("write chunk").execute().await?;
+
+        let changes = repo.collect_branch_changes("main", &snap0).await?;
+        assert!(!changes.has_structural_changes());
+        // Verify chunk changes were captured by checking overlap
+        // with itself (updated_chunks is private)
+        assert!(!changes.overlapping_chunks(&changes).is_empty());
+
+        Ok(())
+    }
+
+    #[tokio_test]
+    #[apply(spec_version_cases)]
+    async fn test_merge_branches_disjoint_arrays(
+        spec_version: SpecVersionBin,
+    ) -> Result<(), Box<dyn Error>> {
+        let storage: Arc<dyn Storage + Send + Sync> = new_in_memory_storage().await?;
+        let repo = Repository::create(
+            None,
+            Arc::clone(&storage),
+            HashMap::new(),
+            Some(spec_version),
+            true,
+        )
+        .await?;
+
+        // Create initial commit with two arrays
+        let mut session = repo.writable_session("main").await?;
+        session.add_group(Path::root(), Bytes::copy_from_slice(b"")).await?;
+        session
+            .add_array(
+                "/array_a".try_into()?,
+                ArrayShape::new(vec![(10, 1)]).unwrap(),
+                None,
+                Bytes::new(),
+            )
+            .await?;
+        session
+            .add_array(
+                "/array_b".try_into()?,
+                ArrayShape::new(vec![(10, 1)]).unwrap(),
+                None,
+                Bytes::new(),
+            )
+            .await?;
+        let snap0 = session.commit("initial").execute().await?;
+
+        // Create feature branch
+        repo.create_branch("feature", &snap0).await?;
+
+        // Write chunk to array_a on main
+        let mut session = repo.writable_session("main").await?;
+        session
+            .set_chunk_ref(
+                "/array_a".try_into()?,
+                ChunkIndices(vec![0]),
+                Some(ChunkPayload::Inline(Bytes::from_static(b"main_data"))),
+            )
+            .await?;
+        session.commit("main: write array_a").execute().await?;
+
+        // Write chunk to array_b on feature
+        let mut session = repo.writable_session("feature").await?;
+        session
+            .set_chunk_ref(
+                "/array_b".try_into()?,
+                ChunkIndices(vec![0]),
+                Some(ChunkPayload::Inline(Bytes::from_static(b"feature_data"))),
+            )
+            .await?;
+        session.commit("feature: write array_b").execute().await?;
+
+        // Merge feature into main
+        let merge_snap =
+            repo.merge_branches("feature", "main", "merge feature into main").await?;
+
+        // Verify both chunks readable from main
+        let session = repo.readonly_session(&VersionInfo::SnapshotId(merge_snap)).await?;
+
+        let path_a: Path = "/array_a".try_into()?;
+        let path_b: Path = "/array_b".try_into()?;
+
+        let chunk_a = session.get_chunk_ref(&path_a, &ChunkIndices(vec![0])).await?;
+        assert!(chunk_a.is_some());
+
+        let chunk_b = session.get_chunk_ref(&path_b, &ChunkIndices(vec![0])).await?;
+        assert!(chunk_b.is_some());
+
+        Ok(())
+    }
+
+    #[tokio_test]
+    #[apply(spec_version_cases)]
+    async fn test_merge_branches_same_branch_error(
+        spec_version: SpecVersionBin,
+    ) -> Result<(), Box<dyn Error>> {
+        let storage: Arc<dyn Storage + Send + Sync> = new_in_memory_storage().await?;
+        let repo = Repository::create(
+            None,
+            Arc::clone(&storage),
+            HashMap::new(),
+            Some(spec_version),
+            true,
+        )
+        .await?;
+
+        let result = repo.merge_branches("main", "main", "self merge").await;
+        assert!(matches!(
+            result.unwrap_err().kind,
+            RepositoryErrorKind::CannotMergeBranchIntoItself,
+        ));
+        Ok(())
+    }
+
+    #[tokio_test]
+    #[apply(spec_version_cases)]
+    async fn test_merge_branches_overlapping_chunks_error(
+        spec_version: SpecVersionBin,
+    ) -> Result<(), Box<dyn Error>> {
+        let storage: Arc<dyn Storage + Send + Sync> = new_in_memory_storage().await?;
+        let repo = Repository::create(
+            None,
+            Arc::clone(&storage),
+            HashMap::new(),
+            Some(spec_version),
+            true,
+        )
+        .await?;
+
+        // Setup: one array, two branches write same chunk
+        let mut session = repo.writable_session("main").await?;
+        session.add_group(Path::root(), Bytes::copy_from_slice(b"")).await?;
+        session
+            .add_array(
+                "/array".try_into()?,
+                ArrayShape::new(vec![(10, 1)]).unwrap(),
+                None,
+                Bytes::new(),
+            )
+            .await?;
+        let snap0 = session.commit("initial").execute().await?;
+
+        repo.create_branch("feature", &snap0).await?;
+
+        // Main writes chunk [0]
+        let mut session = repo.writable_session("main").await?;
+        session
+            .set_chunk_ref(
+                "/array".try_into()?,
+                ChunkIndices(vec![0]),
+                Some(ChunkPayload::Inline(Bytes::from_static(b"main"))),
+            )
+            .await?;
+        session.commit("main: write").execute().await?;
+
+        // Feature also writes chunk [0]
+        let mut session = repo.writable_session("feature").await?;
+        session
+            .set_chunk_ref(
+                "/array".try_into()?,
+                ChunkIndices(vec![0]),
+                Some(ChunkPayload::Inline(Bytes::from_static(b"feature"))),
+            )
+            .await?;
+        session.commit("feature: write").execute().await?;
+
+        let result = repo.merge_branches("feature", "main", "conflict merge").await;
+        assert!(matches!(
+            result.unwrap_err().kind,
+            RepositoryErrorKind::MergeConflict { .. },
+        ));
+        Ok(())
+    }
+
+    #[tokio_test]
+    #[apply(spec_version_cases)]
+    async fn test_merge_branches_structural_changes_error(
+        spec_version: SpecVersionBin,
+    ) -> Result<(), Box<dyn Error>> {
+        let storage: Arc<dyn Storage + Send + Sync> = new_in_memory_storage().await?;
+        let repo = Repository::create(
+            None,
+            Arc::clone(&storage),
+            HashMap::new(),
+            Some(spec_version),
+            true,
+        )
+        .await?;
+
+        // Setup: initial commit with root group
+        let mut session = repo.writable_session("main").await?;
+        session.add_group(Path::root(), Bytes::copy_from_slice(b"")).await?;
+        let snap0 = session.commit("initial").execute().await?;
+
+        repo.create_branch("feature", &snap0).await?;
+
+        // Add an array on main so both branches diverge
+        let mut session = repo.writable_session("main").await?;
+        session
+            .add_array(
+                "/main_array".try_into()?,
+                ArrayShape::new(vec![(10, 1)]).unwrap(),
+                None,
+                Bytes::new(),
+            )
+            .await?;
+        session.commit("main: new array").execute().await?;
+
+        // Source branch also creates a new array
+        let mut session = repo.writable_session("feature").await?;
+        session
+            .add_array(
+                "/new_array".try_into()?,
+                ArrayShape::new(vec![(10, 1)]).unwrap(),
+                None,
+                Bytes::new(),
+            )
+            .await?;
+        session.commit("feature: new array").execute().await?;
+
+        let result = repo.merge_branches("feature", "main", "struct merge").await;
+        assert!(matches!(
+            result.unwrap_err().kind,
+            RepositoryErrorKind::MergeNotSupported { .. },
+        ));
+        Ok(())
+    }
+
+    #[tokio_test]
+    #[apply(spec_version_cases)]
+    async fn test_merge_branches_fast_forward(
+        spec_version: SpecVersionBin,
+    ) -> Result<(), Box<dyn Error>> {
+        let storage: Arc<dyn Storage + Send + Sync> = new_in_memory_storage().await?;
+        let repo = Repository::create(
+            None,
+            Arc::clone(&storage),
+            HashMap::new(),
+            Some(spec_version),
+            true,
+        )
+        .await?;
+
+        // Setup: initial commit, branch, commit only on feature
+        let mut session = repo.writable_session("main").await?;
+        session.add_group(Path::root(), Bytes::copy_from_slice(b"")).await?;
+        session
+            .add_array(
+                "/array".try_into()?,
+                ArrayShape::new(vec![(10, 1)]).unwrap(),
+                None,
+                Bytes::new(),
+            )
+            .await?;
+        let snap0 = session.commit("initial").execute().await?;
+
+        repo.create_branch("feature", &snap0).await?;
+
+        // Only feature has changes
+        let mut session = repo.writable_session("feature").await?;
+        session
+            .set_chunk_ref(
+                "/array".try_into()?,
+                ChunkIndices(vec![0]),
+                Some(ChunkPayload::Inline(Bytes::from_static(b"data"))),
+            )
+            .await?;
+        session.commit("feature: write").execute().await?;
+
+        let feature_tip = repo.lookup_branch("feature").await?;
+        let merge_snap = repo.merge_branches("feature", "main", "ff merge").await?;
+
+        // For V1: fast-forward means merge_snap == feature_tip
+        // For V2: a new merge snapshot is created
+        if spec_version == SpecVersionBin::V1 {
+            assert_eq!(merge_snap, feature_tip);
+        }
+
+        // In both cases, the data should be readable on main
+        let session = repo.readonly_session(&VersionInfo::SnapshotId(merge_snap)).await?;
+        let path: Path = "/array".try_into()?;
+        let chunk = session.get_chunk_ref(&path, &ChunkIndices(vec![0])).await?;
+        assert!(chunk.is_some());
+
+        Ok(())
+    }
+
+    #[tokio_test]
+    #[apply(spec_version_cases)]
+    async fn test_merge_branches_same_array_disjoint_chunks(
+        spec_version: SpecVersionBin,
+    ) -> Result<(), Box<dyn Error>> {
+        let storage: Arc<dyn Storage + Send + Sync> = new_in_memory_storage().await?;
+        let repo = Repository::create(
+            None,
+            Arc::clone(&storage),
+            HashMap::new(),
+            Some(spec_version),
+            true,
+        )
+        .await?;
+
+        // Setup: one array, branches write different chunks
+        let mut session = repo.writable_session("main").await?;
+        session.add_group(Path::root(), Bytes::copy_from_slice(b"")).await?;
+        session
+            .add_array(
+                "/array".try_into()?,
+                ArrayShape::new(vec![(10, 2)]).unwrap(),
+                None,
+                Bytes::new(),
+            )
+            .await?;
+        let snap0 = session.commit("initial").execute().await?;
+
+        repo.create_branch("feature", &snap0).await?;
+
+        // Main writes chunk [0]
+        let mut session = repo.writable_session("main").await?;
+        session
+            .set_chunk_ref(
+                "/array".try_into()?,
+                ChunkIndices(vec![0]),
+                Some(ChunkPayload::Inline(Bytes::from_static(b"main"))),
+            )
+            .await?;
+        session.commit("main: chunk 0").execute().await?;
+
+        // Feature writes chunk [1]
+        let mut session = repo.writable_session("feature").await?;
+        session
+            .set_chunk_ref(
+                "/array".try_into()?,
+                ChunkIndices(vec![1]),
+                Some(ChunkPayload::Inline(Bytes::from_static(b"feature"))),
+            )
+            .await?;
+        session.commit("feature: chunk 1").execute().await?;
+
+        let merge_snap =
+            repo.merge_branches("feature", "main", "same array merge").await?;
+
+        // Verify both chunks readable
+        let session = repo.readonly_session(&VersionInfo::SnapshotId(merge_snap)).await?;
+        let path: Path = "/array".try_into()?;
+        let c0 = session.get_chunk_ref(&path, &ChunkIndices(vec![0])).await?;
+        let c1 = session.get_chunk_ref(&path, &ChunkIndices(vec![1])).await?;
+        assert!(c0.is_some());
+        assert!(c1.is_some());
+        Ok(())
+    }
+
+    #[tokio_test]
+    #[apply(spec_version_cases)]
+    async fn test_merge_preserves_source_branch(
+        spec_version: SpecVersionBin,
+    ) -> Result<(), Box<dyn Error>> {
+        let storage: Arc<dyn Storage + Send + Sync> = new_in_memory_storage().await?;
+        let repo = Repository::create(
+            None,
+            Arc::clone(&storage),
+            HashMap::new(),
+            Some(spec_version),
+            true,
+        )
+        .await?;
+
+        let mut session = repo.writable_session("main").await?;
+        session.add_group(Path::root(), Bytes::copy_from_slice(b"")).await?;
+        session
+            .add_array(
+                "/array_a".try_into()?,
+                ArrayShape::new(vec![(10, 1)]).unwrap(),
+                None,
+                Bytes::new(),
+            )
+            .await?;
+        session
+            .add_array(
+                "/array_b".try_into()?,
+                ArrayShape::new(vec![(10, 1)]).unwrap(),
+                None,
+                Bytes::new(),
+            )
+            .await?;
+        let snap0 = session.commit("initial").execute().await?;
+
+        repo.create_branch("feature", &snap0).await?;
+
+        let mut session = repo.writable_session("feature").await?;
+        session
+            .set_chunk_ref(
+                "/array_b".try_into()?,
+                ChunkIndices(vec![0]),
+                Some(ChunkPayload::Inline(Bytes::from_static(b"data"))),
+            )
+            .await?;
+        session.commit("feature: write").execute().await?;
+
+        let feature_tip_before = repo.lookup_branch("feature").await?;
+
+        repo.merge_branches("feature", "main", "merge").await?;
+
+        let feature_tip_after = repo.lookup_branch("feature").await?;
+        assert_eq!(feature_tip_before, feature_tip_after);
         Ok(())
     }
 }

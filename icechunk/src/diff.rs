@@ -43,6 +43,42 @@ impl DiffBuilder {
         }
     }
 
+    /// Returns true if the builder contains any non-chunk changes
+    /// (new/deleted/updated arrays or groups, or moves).
+    pub fn has_structural_changes(&self) -> bool {
+        !self.new_groups.is_empty()
+            || !self.new_arrays.is_empty()
+            || !self.deleted_groups.is_empty()
+            || !self.deleted_arrays.is_empty()
+            || !self.updated_groups.is_empty()
+            || !self.updated_arrays.is_empty()
+            || !self.moved_nodes.is_empty()
+    }
+
+    /// Returns the set of `(NodeId, Vec<ChunkIndices>)` where both
+    /// builders have modified the same chunks.
+    pub fn overlapping_chunks(
+        &self,
+        other: &DiffBuilder,
+    ) -> Vec<(NodeId, Vec<ChunkIndices>)> {
+        let mut result = Vec::new();
+        for (node_id, our_chunks) in &self.updated_chunks {
+            if let Some(their_chunks) = other.updated_chunks.get(node_id) {
+                let overlap: Vec<ChunkIndices> =
+                    our_chunks.intersection(their_chunks).cloned().collect();
+                if !overlap.is_empty() {
+                    result.push((node_id.clone(), overlap));
+                }
+            }
+        }
+        result
+    }
+
+    /// Returns an iterator over the `NodeId`s that have chunk updates.
+    pub fn updated_chunk_node_ids(&self) -> impl Iterator<Item = &NodeId> {
+        self.updated_chunks.keys()
+    }
+
     pub async fn to_diff(self, from: &Session, to: &Session) -> SessionResult<Diff> {
         let nodes: HashMap<NodeId, Path> = from
             .list_nodes(&Path::root())
@@ -134,5 +170,49 @@ impl Diff {
             && self.updated_arrays.is_empty()
             && self.updated_chunks.is_empty()
             && self.moved_nodes.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_diff_builder_has_structural_changes() {
+        let mut builder = DiffBuilder::default();
+        assert!(!builder.has_structural_changes());
+
+        builder.new_arrays.insert(NodeId::random());
+        assert!(builder.has_structural_changes());
+    }
+
+    #[test]
+    fn test_diff_builder_chunk_overlap_disjoint() {
+        let node = NodeId::random();
+        let mut a = DiffBuilder::default();
+        let mut b = DiffBuilder::default();
+
+        a.updated_chunks.insert(node.clone(), BTreeSet::from([ChunkIndices(vec![0, 0])]));
+        b.updated_chunks.insert(node.clone(), BTreeSet::from([ChunkIndices(vec![1, 1])]));
+
+        assert!(a.overlapping_chunks(&b).is_empty());
+    }
+
+    #[test]
+    fn test_diff_builder_chunk_overlap_conflict() {
+        let node = NodeId::random();
+        let mut a = DiffBuilder::default();
+        let mut b = DiffBuilder::default();
+
+        a.updated_chunks.insert(node.clone(), BTreeSet::from([ChunkIndices(vec![0, 0])]));
+        b.updated_chunks.insert(
+            node.clone(),
+            BTreeSet::from([ChunkIndices(vec![0, 0]), ChunkIndices(vec![1, 1])]),
+        );
+
+        let overlaps = a.overlapping_chunks(&b);
+        assert_eq!(overlaps.len(), 1);
+        assert_eq!(overlaps[0].0, node);
+        assert_eq!(overlaps[0].1, vec![ChunkIndices(vec![0, 0])]);
     }
 }

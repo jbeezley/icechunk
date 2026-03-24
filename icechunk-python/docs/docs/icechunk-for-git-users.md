@@ -178,4 +178,16 @@ repo.lookup_tag("my-new-tag")
 
 ## Merging and Rebasing
 
-Git supports merging and rebasing branches together. Icechunk currently does not support merging and rebasing branches together. It does support [rebasing sessions that share the same branch](version-control.md#conflict-resolution).
+Git supports merging and rebasing branches together. Icechunk supports [rebasing sessions that share the same branch](version-control.md#conflict-resolution) as well as [merging branches](version-control.md#branch-merging) that have diverged.
+
+### Merging Branches
+
+Icechunk's [`repo.merge_branches()`](reference.md#icechunk.Repository.merge_branches) merges a source branch into a target branch, similar to `git merge`. However, it is currently limited to cases where both branches have only modified chunk data (no structural changes like creating or deleting arrays/groups) and those chunk modifications are to completely disjoint sets of chunks. If both branches wrote to the same chunk, the merge is rejected with a conflict error.
+
+```python
+repo.merge_branches("feature", "main", "merge feature into main")
+```
+
+### Rebasing Sessions
+
+Icechunk also supports rebasing sessions that share the same branch using the [`session.rebase()`](reference.md#icechunk.Session.rebase) method. See [Conflict Resolution](version-control.md#conflict-resolution) for details.
