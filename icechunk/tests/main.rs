@@ -14,4 +14,5 @@ mod test_gc;
 mod test_shuttle;
 mod test_stats;
 mod test_storage;
+mod test_virtual_chunk_references;
 mod test_virtual_refs;

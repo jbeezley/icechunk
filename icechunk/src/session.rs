@@ -64,6 +64,14 @@ use crate::{
 };
 use icechunk_types::{ICResultExt as _, error::ICResultCtxExt as _};
 
+/// A reference to an external object backing a virtual chunk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VirtualObjectReference {
+    pub location: String,
+    pub offset: u64,
+    pub length: u64,
+}
+
 /// The mode of a session, determining what operations are allowed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SessionMode {
@@ -220,6 +228,17 @@ where
     // Note: I don't think we can distinguish between out of bounds index for the array
     //       and an index that is part of a split that hasn't been written yet.
     enumerate(iter).find(|(_, e)| e.contains(coord.0.as_slice()))
+}
+
+fn coord_in_bbox(
+    coord: &ChunkIndices,
+    bbox: &[(u32, u32)],
+) -> bool {
+    coord
+        .0
+        .iter()
+        .zip(bbox)
+        .all(|(c, (lo, hi))| *c >= *lo && *c <= *hi)
 }
 
 pub type RebaseHook =
@@ -1112,6 +1131,83 @@ impl Session {
                 }
             }
         }
+    }
+
+    /// Return virtual chunk references within a coordinate bounding box.
+    ///
+    /// `chunk_bbox` is a per-dimension `(start, end)` inclusive range.
+    /// Only `ChunkPayload::Virtual` chunks are returned; `Ref` and
+    /// `Inline` are skipped.
+    pub async fn get_virtual_chunk_references(
+        &self,
+        array_path: &Path,
+        chunk_bbox: &[(u32, u32)],
+    ) -> SessionResult<Vec<VirtualObjectReference>> {
+        let node = self.get_array(array_path).await?;
+        let node_id = node.id.clone();
+        let NodeData::Array { manifests, .. } = &node.node_data else {
+            return Err(SessionError::capture(
+                SessionErrorKind::NotAnArray {
+                    node: Box::new(node),
+                    message: "getting virtual chunk references"
+                        .to_string(),
+                },
+            ));
+        };
+
+        // Build ManifestExtents from the bbox for intersection
+        let bbox_extents = ManifestExtents::from_ranges_iter(
+            chunk_bbox.iter().map(|(lo, hi)| *lo..*hi + 1),
+        );
+
+        let mut refs = Vec::new();
+
+        // Check committed manifests
+        for manifest_ref in manifests {
+            if manifest_ref
+                .extents
+                .intersection(&bbox_extents)
+                .is_none()
+            {
+                continue;
+            }
+
+            let manifest =
+                self.fetch_manifest(&manifest_ref.object_id).await?;
+            let iter =
+                manifest.iter(node_id.clone()).map_err(|e| e.inject())?;
+            for item in iter {
+                let (coord, payload) = item.map_err(|e| e.inject())?;
+                if !coord_in_bbox(&coord, chunk_bbox) {
+                    continue;
+                }
+                if let ChunkPayload::Virtual(vref) = payload {
+                    refs.push(VirtualObjectReference {
+                        location: vref.location.url().to_string(),
+                        offset: vref.offset,
+                        length: vref.length,
+                    });
+                }
+            }
+        }
+
+        // Check uncommitted changes in the changeset
+        for (coord, payload_opt) in
+            self.change_set().array_chunks_iterator(&node_id, array_path)
+        {
+            if !coord_in_bbox(coord, chunk_bbox) {
+                continue;
+            }
+            if let Some(ChunkPayload::Virtual(vref)) = payload_opt {
+                refs.push(VirtualObjectReference {
+                    location: vref.location.url().to_string(),
+                    offset: vref.offset,
+                    length: vref.length,
+                });
+            }
+        }
+
+        Ok(refs)
     }
 
     /// Get a future that reads the the payload of a chunk from object store

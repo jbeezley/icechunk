@@ -264,6 +264,29 @@ class Session:
         """
         return await self._session.all_virtual_chunk_locations_async()
 
+    async def get_virtual_chunk_references(
+        self,
+        array_path: str,
+        chunk_bbox: list[tuple[int, int]],
+    ) -> list[tuple[str, int, int]]:
+        """Return virtual chunk references within a coordinate bounding box.
+
+        Parameters
+        ----------
+        array_path
+            Path to the array in the store (e.g., "temperature").
+        chunk_bbox
+            Per-dimension (start_chunk, end_chunk) inclusive ranges.
+
+        Returns
+        -------
+        List of (uri, byte_offset, byte_length) tuples for virtual
+        chunks within the bounding box.
+        """
+        return await self._session.get_virtual_chunk_references(
+            array_path, chunk_bbox
+        )
+
     async def chunk_coordinates(
         self, array_path: str, batch_size: int = 1000
     ) -> AsyncIterator[tuple[int, ...]]:

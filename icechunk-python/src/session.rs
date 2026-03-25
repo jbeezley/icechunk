@@ -340,6 +340,69 @@ impl PySession {
         })
     }
 
+    pub fn get_virtual_chunk_references<'py>(
+        &self,
+        py: Python<'py>,
+        array_path: String,
+        chunk_bbox: Vec<(u32, u32)>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let session = Arc::clone(&self.0);
+        pyo3_async_runtimes::tokio::future_into_py::<_, Vec<(String, u64, u64)>>(
+            py,
+            async move {
+                let session = session.read().await;
+                let path = Path::new(array_path.as_str())
+                    .map_err(|e| {
+                        StoreError::capture(StoreErrorKind::PathError(e))
+                    })
+                    .map_err(PyIcechunkStoreError::StoreError)?;
+                let refs = session
+                    .get_virtual_chunk_references(&path, &chunk_bbox)
+                    .await
+                    .map_err(PyIcechunkStoreError::SessionError)?;
+                Ok(refs
+                    .into_iter()
+                    .map(|r| (r.location, r.offset, r.length))
+                    .collect())
+            },
+        )
+    }
+
+    pub fn get_virtual_chunk_references_sync(
+        &self,
+        py: Python<'_>,
+        array_path: String,
+        chunk_bbox: Vec<(u32, u32)>,
+    ) -> PyIcechunkStoreResult<Vec<(String, u64, u64)>> {
+        let session = Arc::clone(&self.0);
+        py.detach(move || {
+            pyo3_async_runtimes::tokio::get_runtime().block_on(
+                async move {
+                    let session = session.read().await;
+                    let path = Path::new(array_path.as_str())
+                        .map_err(|e| {
+                            StoreError::capture(
+                                StoreErrorKind::PathError(e),
+                            )
+                        })
+                        .map_err(PyIcechunkStoreError::StoreError)?;
+                    let refs = session
+                        .get_virtual_chunk_references(
+                            &path, &chunk_bbox,
+                        )
+                        .await
+                        .map_err(
+                            PyIcechunkStoreError::SessionError,
+                        )?;
+                    Ok(refs
+                        .into_iter()
+                        .map(|r| (r.location, r.offset, r.length))
+                        .collect())
+                },
+            )
+        })
+    }
+
     /// Return vectors of coordinates, up to `batch_size` in length.
     ///
     /// We batch the results to make it faster.

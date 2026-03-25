@@ -460,3 +460,96 @@ class IcechunkStore(Store, SyncMixin):
 
     async def getsize_prefix(self, prefix: str) -> int:
         return await self._store.getsize_prefix(prefix)
+
+    @staticmethod
+    def _indexer_to_chunk_bbox(
+        zarr_array: Any,
+        indexer: Any,
+    ) -> "list[tuple[int, int]]":
+        """Convert an xarray ExplicitIndexer to per-dimension chunk ranges."""
+        import math
+
+        import numpy as np
+
+        shape = zarr_array.shape
+        chunks = zarr_array.chunks
+
+        if indexer is None:
+            return [
+                (0, math.ceil(s / c) - 1)
+                for s, c in zip(shape, chunks, strict=False)
+            ]
+
+        bbox = []
+        for dim_idx, dim_key in enumerate(indexer.tuple):
+            chunk_size = chunks[dim_idx]
+            dim_size = shape[dim_idx]
+
+            if isinstance(dim_key, slice):
+                start, stop, _ = dim_key.indices(dim_size)
+                if start >= stop:
+                    bbox.append((0, -1))  # empty range
+                else:
+                    bbox.append((
+                        start // chunk_size,
+                        (stop - 1) // chunk_size,
+                    ))
+            elif isinstance(dim_key, (int, np.integer)):
+                c = int(dim_key) // chunk_size
+                bbox.append((c, c))
+            else:
+                arr = np.asarray(dim_key)
+                bbox.append((
+                    int(arr.min()) // chunk_size,
+                    int(arr.max()) // chunk_size,
+                ))
+
+        return bbox
+
+    def get_object_references(
+        self,
+        zarr_array: Any,
+        indexer: Any = None,
+    ) -> "list[Any]":
+        """Return ObjectRef list for virtual chunks overlapping the indexer.
+
+        This method is called by xarray's ZarrArrayWrapper when it detects
+        the store implements this protocol.
+
+        Parameters
+        ----------
+        zarr_array
+            The zarr array object (provides shape, chunks, path).
+        indexer : ExplicitIndexer or None
+            Selection to filter chunks by. None means all chunks.
+
+        Returns
+        -------
+        list of ObjectRef
+        """
+        try:
+            from xarray.core.object_ref import ObjectRef
+        except ImportError:
+            from dataclasses import dataclass
+
+            @dataclass(frozen=True)
+            class ObjectRef:  # type: ignore[no-redef]
+                uri: str
+                byte_offset: int | None = None
+                byte_length: int | None = None
+
+        bbox = self._indexer_to_chunk_bbox(zarr_array, indexer)
+
+        # Prepend "/" for the icechunk session path convention
+        array_path = zarr_array.path
+        if not array_path.startswith("/"):
+            array_path = "/" + array_path
+
+        refs = self._store.session.get_virtual_chunk_references_sync(
+            array_path, bbox
+        )
+
+        return [
+            ObjectRef(uri=uri, byte_offset=offset, byte_length=length)
+            for uri, offset, length in refs
+        ]
