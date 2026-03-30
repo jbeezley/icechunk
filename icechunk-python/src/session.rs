@@ -373,7 +373,7 @@ impl PySession {
         py: Python<'_>,
         array_path: String,
         chunk_bbox: Vec<(u32, u32)>,
-    ) -> PyIcechunkStoreResult<Vec<(String, u64, u64)>> {
+    ) -> PyResult<Vec<(String, u64, u64)>> {
         let session = Arc::clone(&self.0);
         py.detach(move || {
             pyo3_async_runtimes::tokio::get_runtime().block_on(

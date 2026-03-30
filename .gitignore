@@ -23,6 +23,9 @@ icechunk-python/uv.lock
 
 # Jetbrains IDE
 .idea/
+
+# Git worktrees
+.worktrees/
 # pixi environments
 .pixi/*
 !.pixi/config.toml
